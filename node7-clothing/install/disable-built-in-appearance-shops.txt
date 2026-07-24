@@ -1,0 +1,5 @@
+In node7-appearance/config.lua, replace the existing Node7AppearanceConfig.Shops table with:
+
+Node7AppearanceConfig.Shops = {}
+
+This prevents the old appearance resource from opening a second clothing menu at overlapping shop coordinates.
