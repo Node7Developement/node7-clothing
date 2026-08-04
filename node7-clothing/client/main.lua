@@ -1,20 +1,31 @@
 local Config = Node7ClothingConfig or {}
 local RESOURCE = GetCurrentResourceName()
+local Core = exports['node7-core']:GetCoreObject()
 
+local Camera = nil
+local BeforePosition = nil
+local menuOpen = false
+local menuType = nil
+local originalClothes = {}
+local workingClothes = {}
 local catalog = nil
-local categoryByName = {}
-local storeById = {}
-local session = nil
-local editorCam = nil
-local textUiVisible = false
-local blips = {}
+local flattened = {}
+local prompts = {}
+local pendingOutfitRequest = nil
+local requestSequence = 0
+local pendingOutfitName = nil
+local checkoutPending = false
+local purchaseInFlight = false
+local purchaseSequence = 0
+local pendingPurchaseId = nil
+local outfitActionSequence = 0
+local pendingOutfitActionId = nil
 
-for _, category in ipairs(Config.Categories or {}) do
-    categoryByName[category.name] = category
-end
-
-for _, store in ipairs(Config.Stores or {}) do
-    storeById[store.id] = store
+local function clone(value)
+    if type(value) ~= 'table' then return value end
+    local result = {}
+    for key, item in pairs(value) do result[key] = clone(item) end
+    return result
 end
 
 local function debugLog(message)
@@ -23,120 +34,15 @@ local function debugLog(message)
     end
 end
 
-local function notify(description, notifyType)
-    lib.notify({
-        title = Config.NotifyTitle or 'NODE7 Clothing',
-        description = description,
-        type = notifyType or 'inform'
+local function notify(message, notificationType)
+    if not Core or not Core.Functions or not Core.Functions.Notify then return end
+
+    Core.Functions.Notify({
+        title = 'Tailor',
+        description = tostring(message or 'Clothing update.'),
+        type = notificationType or 'info',
+        duration = 5000
     })
-end
-
-local function clone(value)
-    if type(value) ~= 'table' then return value end
-    local output = {}
-    for key, item in pairs(value) do
-        output[key] = clone(item)
-    end
-    return output
-end
-
-local function roundMoney(value)
-    return math.floor(((tonumber(value) or 0) * 100) + 0.5) / 100
-end
-
-local function money(value)
-    return ('$%.2f'):format(roundMoney(value))
-end
-
-local function normalizeItem(item)
-    if type(item) ~= 'table' then return { model = 0, texture = 1, remove = true } end
-    return {
-        model = math.floor(tonumber(item.model) or 0),
-        texture = math.floor(tonumber(item.texture) or 1),
-        remove = item.remove == true or (tonumber(item.model) or 0) <= 0
-    }
-end
-
-local function sameItem(left, right)
-    left = normalizeItem(left)
-    right = normalizeItem(right)
-    return left.model == right.model and left.texture == right.texture and left.remove == right.remove
-end
-
-local function loadCatalog()
-    if catalog then return true end
-
-    local source = LoadResourceFile('node7-appearance', 'data/clothing.lua')
-    if not source or source == '' then
-        notify('Unable to read node7-appearance clothing data.', 'error')
-        return false
-    end
-
-    local chunk, compileError = load(source, '@node7-appearance/data/clothing.lua', 't', {})
-    if not chunk then
-        debugLog(compileError)
-        notify('node7-appearance clothing data failed to compile.', 'error')
-        return false
-    end
-
-    local ok, data = pcall(chunk)
-    if not ok or type(data) ~= 'table' then
-        debugLog(data)
-        notify('node7-appearance clothing catalog is invalid.', 'error')
-        return false
-    end
-
-    catalog = data
-    return true
-end
-
-local function getGenderCatalog()
-    if not loadCatalog() then return nil end
-    return catalog[IsPedMale(PlayerPedId()) and 'male' or 'female'] or {}
-end
-
-local function getCategoryList(category)
-    local genderCatalog = getGenderCatalog()
-    return genderCatalog and genderCatalog[category] or nil
-end
-
-local function getItemHash(list, model, texture)
-    model = math.floor(tonumber(model) or 0)
-    texture = math.floor(tonumber(texture) or 1)
-    if model <= 0 or not list or not list[model] or not list[model][texture] then return nil end
-    return tonumber(list[model][texture].hash)
-end
-
-local function appearanceReady()
-    return GetResourceState('node7-appearance') == 'started'
-end
-
-local function applyClothes(clothes)
-    if not appearanceReady() then
-        notify('node7-appearance is not started.', 'error')
-        return false
-    end
-
-    local ok, err = pcall(function()
-        exports['node7-appearance']:ApplyClothes(clothes)
-    end)
-
-    if not ok then
-        debugLog(err)
-        notify('Failed to apply clothing preview.', 'error')
-        return false
-    end
-
-    return true
-end
-
-local function getCurrentClothes()
-    if not appearanceReady() then return {} end
-    local ok, clothes = pcall(function()
-        return exports['node7-appearance']:GetCurrentClothes()
-    end)
-    if not ok or type(clothes) ~= 'table' then return {} end
-    return clone(clothes)
 end
 
 local function forceVisible()
@@ -146,540 +52,717 @@ local function forceVisible()
     SetEntityCollision(ped, true, true)
 end
 
-local function updateCamera(viewName)
-    if not session or not editorCam then return end
+local function loadCatalog(silent)
+    if catalog then return true end
 
-    viewName = viewName or session.cameraView or Config.Camera.focus or 'full'
-    local view = Config.Camera.views[viewName] or Config.Camera.views.full
-    session.cameraView = viewName
-
-    local ped = PlayerPedId()
-    local camPos = GetOffsetFromEntityInWorldCoords(ped, 0.0, tonumber(view.distance) or 2.2, tonumber(view.cameraZ) or 0.85)
-    SetCamCoord(editorCam, camPos.x, camPos.y, camPos.z)
-    PointCamAtEntity(editorCam, ped, 0.0, 0.0, tonumber(view.focusZ) or 0.75, true)
-    SetCamFov(editorCam, 42.0)
-end
-
-local function startCamera()
-    if editorCam then return end
-    editorCam = CreateCam('DEFAULT_SCRIPTED_CAMERA', true)
-    SetCamActive(editorCam, true)
-    RenderScriptCams(true, true, 300, true, true)
-    updateCamera()
-end
-
-local function stopCamera()
-    if not editorCam then return end
-    RenderScriptCams(false, true, 300, true, true)
-    DestroyCam(editorCam, false)
-    editorCam = nil
-end
-
-local function movePlayer(position)
-    if not position then return end
-    local ped = PlayerPedId()
-    SetEntityCoordsNoOffset(ped, position.x, position.y, position.z, false, false, false)
-    SetEntityHeading(ped, position.w or position.h or 0.0)
-end
-
-local function beginEditor(store)
-    local ped = PlayerPedId()
-    session.startPosition = GetEntityCoords(ped)
-    session.startHeading = GetEntityHeading(ped)
-
-    if Config.FadeDuringEditorMove then
-        DoScreenFadeOut(250)
-        local timeout = GetGameTimer() + 1500
-        while not IsScreenFadedOut() and GetGameTimer() < timeout do Wait(0) end
-    end
-
-    if Config.TeleportToEditor ~= false and store.editor then
-        movePlayer(store.editor)
-    end
-
-    FreezeEntityPosition(ped, true)
-    DisplayRadar(false)
-    forceVisible()
-    startCamera()
-
-    if Config.FadeDuringEditorMove then
-        DoScreenFadeIn(250)
-    end
-end
-
-local function buildRollback()
-    if not session then return {} end
-    local rollback = clone(session.original)
-    for category in pairs(session.touched or {}) do
-        if rollback[category] == nil then
-            rollback[category] = { model = 0, texture = 1, remove = true }
-        end
-    end
-    return rollback
-end
-
-local function changedCategories()
-    local changed = {}
-    if not session then return changed end
-
-    for _, category in ipairs(Config.Categories or {}) do
-        if not sameItem(session.original[category.name], session.working[category.name]) then
-            changed[#changed + 1] = category
-        end
-    end
-    return changed
-end
-
-local function cartTotal()
-    local total = 0.0
-    for _, category in ipairs(changedCategories()) do
-        local item = normalizeItem(session.working[category.name])
-        if Config.ChargeForRemoval or not item.remove then
-            total = total + (tonumber(category.price) or 0.0)
-        end
-    end
-    return roundMoney(total)
-end
-
-local function hasChanges()
-    return #changedCategories() > 0
-end
-
-local function closeSession(keepChanges)
-    if not session then return end
-    local active = session
-
-    if not keepChanges then
-        applyClothes(buildRollback())
-        Wait(50)
-        applyClothes(active.original)
-    end
-
-    stopCamera()
-    DisplayRadar(true)
-    FreezeEntityPosition(PlayerPedId(), false)
-
-    if Config.FadeDuringEditorMove then
-        DoScreenFadeOut(200)
-        Wait(220)
-    end
-
-    if active.store and active.store.exit then
-        movePlayer(active.store.exit)
-    elseif active.startPosition then
-        SetEntityCoordsNoOffset(PlayerPedId(), active.startPosition.x, active.startPosition.y, active.startPosition.z, false, false, false)
-        SetEntityHeading(PlayerPedId(), active.startHeading or 0.0)
-    end
-
-    forceVisible()
-    session = nil
-
-    if Config.FadeDuringEditorMove then
-        DoScreenFadeIn(200)
-    end
-end
-
-local openStoreMenu
-local openCategoriesMenu
-local openCategoryMenu
-local openCameraMenu
-
-local function previewCategory(categoryName, model, texture, remove)
-    if not session then return end
-    local list = getCategoryList(categoryName) or {}
-    model = math.max(0, math.min(math.floor(tonumber(model) or 0), #list))
-
-    local maxTexture = 1
-    if model > 0 and list[model] then maxTexture = math.max(1, #list[model]) end
-    texture = math.max(1, math.min(math.floor(tonumber(texture) or 1), maxTexture))
-
-    local item = {
-        model = model,
-        texture = texture,
-        remove = remove == true or model == 0
-    }
-
-    if not item.remove then
-        item.hash = getItemHash(list, model, texture)
-    end
-
-    session.working[categoryName] = item
-    session.touched[categoryName] = true
-    applyClothes(session.working)
-    forceVisible()
-end
-
-openCategoryMenu = function(categoryName)
-    if not session then return end
-    local category = categoryByName[categoryName]
-    local list = getCategoryList(categoryName) or {}
-    if not category or #list == 0 then
-        notify('This category has no compatible items for the current ped.', 'error')
-        openCategoriesMenu()
-        return
-    end
-
-    local current = normalizeItem(session.working[categoryName])
-    local model = math.max(0, math.min(current.model, #list))
-    local textureMax = (model > 0 and list[model] and #list[model]) or 1
-    local texture = math.max(1, math.min(current.texture, textureMax))
-
-    local function changeModel(delta)
-        local nextModel = model + delta
-        if nextModel < 0 then nextModel = #list end
-        if nextModel > #list then nextModel = 0 end
-        previewCategory(categoryName, nextModel, 1, nextModel == 0)
-        openCategoryMenu(categoryName)
-    end
-
-    local function changeTexture(delta)
-        if model <= 0 then
-            notify('Select a model first.', 'error')
-            openCategoryMenu(categoryName)
-            return
-        end
-        local nextTexture = texture + delta
-        if nextTexture < 1 then nextTexture = textureMax end
-        if nextTexture > textureMax then nextTexture = 1 end
-        previewCategory(categoryName, model, nextTexture, false)
-        openCategoryMenu(categoryName)
-    end
-
-    lib.registerContext({
-        id = 'node7_clothing_category_' .. categoryName,
-        title = category.label,
-        menu = 'node7_clothing_categories',
-        options = {
-            {
-                title = current.remove and 'Removed' or ('Model %d / Texture %d'):format(model, texture),
-                description = ('%d models | %s when purchased'):format(#list, money(category.price)),
-                disabled = true
-            },
-            { title = 'Previous Model', icon = 'chevron-left', onSelect = function() changeModel(-1) end },
-            { title = 'Next Model', icon = 'chevron-right', onSelect = function() changeModel(1) end },
-            { title = 'Previous Texture', icon = 'minus', onSelect = function() changeTexture(-1) end },
-            { title = 'Next Texture', icon = 'plus', onSelect = function() changeTexture(1) end },
-            {
-                title = 'Set Exact Model / Texture',
-                icon = 'keyboard',
-                onSelect = function()
-                    local input = lib.inputDialog(category.label, {
-                        { type = 'number', label = 'Model', default = model, min = 0, max = #list, required = true },
-                        { type = 'number', label = 'Texture', default = texture, min = 1, max = 999, required = true }
-                    })
-                    if input then
-                        previewCategory(categoryName, input[1], input[2], tonumber(input[1]) == 0)
-                    end
-                    openCategoryMenu(categoryName)
-                end
-            },
-            {
-                title = 'Remove Item',
-                description = Config.ChargeForRemoval and ('Removal costs %s'):format(money(category.price)) or 'Removal is free.',
-                icon = 'trash',
-                onSelect = function()
-                    previewCategory(categoryName, 0, 1, true)
-                    openCategoryMenu(categoryName)
-                end
-            },
-            { title = 'Back', icon = 'arrow-left', onSelect = openCategoriesMenu }
-        }
-    })
-    lib.showContext('node7_clothing_category_' .. categoryName)
-end
-
-openCategoriesMenu = function()
-    if not session then return end
-    local options = {}
-
-    for _, category in ipairs(Config.Categories or {}) do
-        local list = getCategoryList(category.name)
-        if list and #list > 0 then
-            local item = normalizeItem(session.working[category.name])
-            local status = item.remove and 'Removed' or ('Model %d / Texture %d'):format(item.model, item.texture)
-            if not sameItem(session.original[category.name], session.working[category.name]) then
-                status = status .. ' | Changed'
-            end
-            options[#options + 1] = {
-                title = category.label,
-                description = ('%s | %s'):format(status, money(category.price)),
-                icon = category.icon or 'shirt',
-                arrow = true,
-                onSelect = function() openCategoryMenu(category.name) end
-            }
-        end
-    end
-
-    options[#options + 1] = { title = 'Back', icon = 'arrow-left', onSelect = openStoreMenu }
-
-    lib.registerContext({
-        id = 'node7_clothing_categories',
-        title = 'Browse Clothing',
-        menu = 'node7_clothing_store',
-        options = options
-    })
-    lib.showContext('node7_clothing_categories')
-end
-
-openCameraMenu = function()
-    if not session then return end
-    local options = {}
-
-    for name, view in pairs(Config.Camera.views or {}) do
-        options[#options + 1] = {
-            title = view.label or name,
-            description = session.cameraView == name and 'Current view' or nil,
-            icon = 'camera',
-            onSelect = function()
-                updateCamera(name)
-                openCameraMenu()
-            end
-        }
-    end
-
-    options[#options + 1] = {
-        title = 'Rotate Left', icon = 'rotate-left',
-        onSelect = function()
-            SetEntityHeading(PlayerPedId(), GetEntityHeading(PlayerPedId()) + (Config.Camera.rotateStep or 15.0))
-            updateCamera()
-            openCameraMenu()
-        end
-    }
-    options[#options + 1] = {
-        title = 'Rotate Right', icon = 'rotate-right',
-        onSelect = function()
-            SetEntityHeading(PlayerPedId(), GetEntityHeading(PlayerPedId()) - (Config.Camera.rotateStep or 15.0))
-            updateCamera()
-            openCameraMenu()
-        end
-    }
-    options[#options + 1] = { title = 'Back', icon = 'arrow-left', onSelect = openStoreMenu }
-
-    lib.registerContext({
-        id = 'node7_clothing_camera',
-        title = 'Camera Controls',
-        menu = 'node7_clothing_store',
-        options = options
-    })
-    lib.showContext('node7_clothing_camera')
-end
-
-local function openWardrobe()
-    if not session then return end
-    local discarded = hasChanges()
-    closeSession(false)
-
-    if discarded then
-        notify('Unsaved clothing previews were discarded before opening the wardrobe.', 'inform')
-    end
-
-    SetTimeout(300, function()
-        if GetResourceState('node7-wardrobe') ~= 'started' then
-            notify('node7-wardrobe is not started.', 'error')
-            return
-        end
-        local ok = pcall(function()
-            exports['node7-wardrobe']:OpenWardrobe()
-        end)
-        if not ok then TriggerEvent('node7-wardrobe:client:openMenu') end
-    end)
-end
-
-local function checkout()
-    if not session then return end
-
-    local result = lib.callback.await('node7-clothing:server:purchase', false, session.store.id, session.working)
-    if not result or not result.success then
-        notify((result and result.message) or 'Purchase failed.', 'error')
-        openStoreMenu()
-        return
-    end
-
-    local saved = type(result.clothes) == 'table' and result.clothes or session.working
-    applyClothes(saved)
-    notify(('Purchased and saved for %s.'):format(money(result.total or 0)), 'success')
-    closeSession(true)
-end
-
-openStoreMenu = function()
-    if not session then return end
-    local changed = changedCategories()
-    local total = cartTotal()
-
-    lib.registerContext({
-        id = 'node7_clothing_store',
-        title = session.store.label,
-        onExit = function()
-            if session then closeSession(false) end
-        end,
-        options = {
-            {
-                title = 'Browse Clothing',
-                description = ('%d categories available.'):format(#(Config.Categories or {})),
-                icon = 'shirt',
-                arrow = true,
-                onSelect = openCategoriesMenu
-            },
-            {
-                title = 'Camera Controls',
-                description = 'Full body, torso, head, and rotation controls.',
-                icon = 'camera',
-                arrow = true,
-                onSelect = openCameraMenu
-            },
-            {
-                title = 'Cart',
-                description = ('%d changed categories | Total %s'):format(#changed, money(total)),
-                icon = 'cart-shopping',
-                disabled = true
-            },
-            {
-                title = 'Purchase and Save',
-                description = hasChanges() and ('Charge %s and persist to your citizenid.'):format(money(total)) or 'No changes selected.',
-                icon = 'cash-register',
-                disabled = not hasChanges(),
-                onSelect = checkout
-            },
-            {
-                title = 'Wardrobe / Outfits',
-                description = 'Open node7-wardrobe. Unsaved previews will be discarded.',
-                icon = 'box-open',
-                onSelect = openWardrobe
-            },
-            {
-                title = 'Discard and Exit',
-                description = 'Restore the outfit worn before entering.',
-                icon = 'xmark',
-                onSelect = function() closeSession(false) end
-            }
-        }
-    })
-    lib.showContext('node7_clothing_store')
-end
-
-local function openStore(storeId)
-    if session then
-        notify('You are already using a clothing store.', 'error')
-        return false
-    end
-    if not appearanceReady() or not loadCatalog() then return false end
-
-    local store = storeById[storeId]
-    if not store then
-        notify('Invalid clothing store.', 'error')
+    local source = LoadResourceFile('node7-appearance', 'data/clothing.lua')
+    if not source or source == '' then
+        print('[node7-clothing] ERROR: node7-appearance/data/clothing.lua could not be read.')
+        if not silent then notify('Clothing catalog is unavailable.', 'error') end
         return false
     end
 
-    local original = getCurrentClothes()
-    session = {
-        store = store,
-        original = original,
-        working = clone(original),
-        touched = {},
-        cameraView = Config.Camera.focus or 'full'
-    }
+    local chunk, compileError = load(source, '@node7-appearance/data/clothing.lua', 't', {})
+    if not chunk then
+        print(('[node7-clothing] ERROR: clothing catalog compile failed: %s'):format(tostring(compileError)))
+        if not silent then notify('Clothing catalog is unavailable.', 'error') end
+        return false
+    end
 
-    beginEditor(store)
-    openStoreMenu()
+    local ok, data = pcall(chunk)
+    if not ok or type(data) ~= 'table' then
+        print(('[node7-clothing] ERROR: clothing catalog load failed: %s'):format(tostring(data)))
+        if not silent then notify('Clothing catalog is unavailable.', 'error') end
+        return false
+    end
+
+    catalog = data
     return true
 end
 
-local function getNearestStore(maxDistance)
-    local coords = GetEntityCoords(PlayerPedId())
-    local nearest, nearestDistance
+local function genderName()
+    return IsPedMale(PlayerPedId()) and 'male' or 'female'
+end
 
-    for _, store in ipairs(Config.Stores or {}) do
-        local distance = #(coords - store.coords)
-        if (not nearestDistance or distance < nearestDistance) and (not maxDistance or distance <= maxDistance) then
-            nearest = store
-            nearestDistance = distance
+local function getCategoryList(category)
+    if not loadCatalog() then return nil end
+    local genderCatalog = catalog[genderName()] or {}
+    return genderCatalog[category]
+end
+
+local function rebuildFlattened()
+    flattened = {}
+
+    for _, category in ipairs(Config.Categories or {}) do
+        local list = getCategoryList(category.name) or {}
+        local values = {}
+
+        for modelIndex, textures in ipairs(list) do
+            for textureIndex, item in ipairs(textures or {}) do
+                values[#values + 1] = {
+                    model = modelIndex,
+                    texture = textureIndex,
+                    hash = tonumber(item.hash)
+                }
+            end
+        end
+
+        flattened[category.name] = values
+    end
+end
+
+local function normalizeItem(item)
+    if type(item) ~= 'table' then
+        return { model = 0, texture = 1, remove = true }
+    end
+
+    local model = math.floor(tonumber(item.model) or 0)
+    local texture = math.max(1, math.floor(tonumber(item.texture) or 1))
+
+    return {
+        model = model,
+        texture = texture,
+        hash = tonumber(item.hash),
+        remove = item.remove == true or model <= 0
+    }
+end
+
+local function sameItem(left, right)
+    left = normalizeItem(left)
+    right = normalizeItem(right)
+
+    return left.model == right.model
+        and left.texture == right.texture
+        and left.remove == right.remove
+end
+
+local function calculateCheckoutTotal()
+    local total = 0.0
+    local changed = 0
+
+    for _, category in ipairs(Config.Categories or {}) do
+        local before = originalClothes[category.name]
+        local after = workingClothes[category.name]
+
+        if not sameItem(before, after) then
+            changed = changed + 1
+            local item = normalizeItem(after)
+
+            if Config.ChargeForRemoval == true or not item.remove then
+                total = total + math.max(0.0, tonumber(category.price) or 0.0)
+            end
         end
     end
 
-    return nearest, nearestDistance
+    return math.floor((total * 100) + 0.5) / 100, changed
 end
 
-local function createBlip(store)
-    if Config.UseBlips == false then return end
-    local ok, blip = pcall(function()
-        local handle = Citizen.InvokeNative(0x554D9D53F696D002, 1664425300, store.coords.x, store.coords.y, store.coords.z)
-        SetBlipSprite(handle, Config.BlipSprite or 1195729388, true)
-        SetBlipScale(handle, Config.BlipScale or 0.20)
-        Citizen.InvokeNative(0x9CB1A1623062F402, handle, CreateVarString(10, 'LITERAL_STRING', store.label))
-        return handle
+local function flatIndexFor(category, item)
+    item = normalizeItem(item)
+    if item.remove then return 0 end
+
+    for index, value in ipairs(flattened[category] or {}) do
+        if value.model == item.model and value.texture == item.texture then
+            return index
+        end
+    end
+
+    return 0
+end
+
+local function itemForFlatIndex(category, index)
+    index = math.floor(tonumber(index) or 0)
+    if index <= 0 then
+        return { model = 0, texture = 1, remove = true }
+    end
+
+    local value = (flattened[category] or {})[index]
+    if not value then
+        return { model = 0, texture = 1, remove = true }
+    end
+
+    return {
+        model = value.model,
+        texture = value.texture,
+        hash = value.hash,
+        remove = false
+    }
+end
+
+local function refreshPed(ped)
+    Citizen.InvokeNative(0x704C908E9C405136, ped)
+    Citizen.InvokeNative(0xCC8CA3E88256E58F, ped, 0, 1, 1, 1, 0)
+end
+
+local function applySingleCategory(category, item)
+    local ped = PlayerPedId()
+    item = normalizeItem(item)
+
+    local ok, err = pcall(function()
+        Citizen.InvokeNative(0xD710A5007C2AC539, ped, GetHashKey(category), 0)
+        if not item.remove and item.hash then
+            Citizen.InvokeNative(0xD3A7B003ED343FD9, ped, item.hash, true, true, true)
+        end
+        refreshPed(ped)
     end)
 
-    if ok and blip then blips[#blips + 1] = blip end
+    if not ok then debugLog(err) end
+    forceVisible()
+    return ok
 end
 
-RegisterNetEvent('node7-clothing:client:open', function(storeId)
-    if storeId then
-        openStore(tostring(storeId))
+local function getCurrentClothes()
+    if GetResourceState('node7-appearance') ~= 'started' then return {} end
+
+    local ok, clothes = pcall(function()
+        return exports['node7-appearance']:GetCurrentClothes()
+    end)
+
+    if not ok or type(clothes) ~= 'table' then return {} end
+    return clone(clothes)
+end
+
+local function applyFullClothes(clothes)
+    if GetResourceState('node7-appearance') ~= 'started' then return false end
+
+    local ok, err = pcall(function()
+        exports['node7-appearance']:ApplyClothes(clothes)
+    end)
+
+    if not ok then debugLog(err) end
+    forceVisible()
+    return ok
+end
+
+local function buildClothingValues()
+    local values = {}
+
+    for _, category in ipairs(Config.Categories or {}) do
+        local choices = flattened[category.name] or {}
+        if #choices > 0 then
+            values[#values + 1] = {
+                name = category.name,
+                minValue = 0,
+                maxValue = #choices,
+                currentValue = flatIndexFor(category.name, workingClothes[category.name])
+            }
+        end
+    end
+
+    return values
+end
+
+local function disableCamera()
+    if Camera and DoesCamExist(Camera) then
+        SetCamActive(Camera, false)
+        RenderScriptCams(false, true, 250, true, true)
+        DestroyCam(Camera, false)
+    else
+        RenderScriptCams(false, false, 0, true, true)
+    end
+
+    Camera = nil
+    SetNuiFocus(false, false)
+    FreezeEntityPosition(PlayerPedId(), false)
+end
+
+local function enableCamera()
+    local ped = PlayerPedId()
+
+    if Camera and DoesCamExist(Camera) then
+        DestroyCam(Camera, false)
+    end
+
+    local playerCoords = GetOffsetFromEntityInWorldCoords(ped, 0.0, 2.0, 0.0)
+    Camera = CreateCam('DEFAULT_SCRIPTED_CAMERA', true)
+    SetCamActive(Camera, true)
+    SetCamCoord(Camera, playerCoords.x, playerCoords.y, playerCoords.z + 0.5)
+    SetCamRot(Camera, 0.0, 0.0, GetEntityHeading(ped) + 180.0, 2)
+    RenderScriptCams(true, false, 0, true, true)
+end
+
+local function clothingRoomTransition(coords)
+    local ped = PlayerPedId()
+
+    DoScreenFadeOut(350)
+    local timeout = GetGameTimer() + 2000
+    while not IsScreenFadedOut() and GetGameTimer() < timeout do Wait(0) end
+
+    RequestCollisionAtCoord(coords.x, coords.y, coords.z)
+    SetEntityCoordsNoOffset(ped, coords.x, coords.y, coords.z, false, false, false)
+    SetEntityHeading(ped, coords.w or 0.0)
+
+    timeout = GetGameTimer() + 3000
+    while not HasCollisionLoadedAroundEntity(ped) and GetGameTimer() < timeout do
+        RequestCollisionAtCoord(coords.x, coords.y, coords.z)
+        Wait(0)
+    end
+
+    Wait(150)
+    DoScreenFadeIn(350)
+end
+
+local function restorePosition()
+    if not BeforePosition then return end
+    clothingRoomTransition(BeforePosition)
+    BeforePosition = nil
+end
+
+local function closeMenu(commit)
+    if not menuOpen then return end
+
+    menuOpen = false
+    menuType = nil
+    checkoutPending = false
+    purchaseInFlight = false
+    pendingPurchaseId = nil
+    pendingOutfitName = nil
+
+    SendNUIMessage({ type = 'paymentClose' })
+    SendNUIMessage({ type = 'forceClose' })
+
+    if commit then
+        applyFullClothes(workingClothes)
+    else
+        applyFullClothes(originalClothes)
+    end
+
+    disableCamera()
+    restorePosition()
+    forceVisible()
+end
+
+local function reopenClothingMenu()
+    if not menuOpen then return end
+
+    menuType = 'clothingMenu'
+    SendNUIMessage({ type = 'paymentClose' })
+    SendNUIMessage({ type = 'clothingMenu', clothes = buildClothingValues() })
+end
+
+local function beginCheckout()
+    if not menuOpen or checkoutPending or purchaseInFlight then return end
+
+    if menuType ~= 'clothingMenu' then
+        closeMenu(true)
         return
     end
-    local store = getNearestStore(15.0)
-    if store then openStore(store.id) else notify('No clothing store is nearby.', 'error') end
+
+    local total, changed = calculateCheckoutTotal()
+
+    if changed <= 0 then
+        if pendingOutfitName and pendingOutfitName ~= '' then
+            outfitActionSequence = outfitActionSequence + 1
+            pendingOutfitActionId = ('%s:save:%s'):format(
+                GetPlayerServerId(PlayerId()),
+                outfitActionSequence
+            )
+            TriggerServerEvent(
+                'node7-clothing:server:saveCurrentOutfit',
+                pendingOutfitActionId,
+                pendingOutfitName
+            )
+        else
+            notify('No clothing changes were selected.', 'info')
+        end
+
+        closeMenu(true)
+        return
+    end
+
+    checkoutPending = true
+    SendNUIMessage({
+        type = 'paymentMenu',
+        total = total,
+        changed = changed,
+        methods = Config.PaymentMethods or {
+            cash = 'Cash',
+            bank = 'Bank'
+        }
+    })
+end
+
+local function requestOutfits(callback)
+    requestSequence = requestSequence + 1
+    local requestId = requestSequence
+    pendingOutfitRequest = { id = requestId, callback = callback }
+    TriggerServerEvent('node7-clothing:server:getOutfits', requestId)
+end
+
+RegisterNetEvent('node7-clothing:client:outfitsResponse', function(requestId, outfits)
+    if not pendingOutfitRequest or pendingOutfitRequest.id ~= requestId then return end
+    local callback = pendingOutfitRequest.callback
+    pendingOutfitRequest = nil
+    callback(type(outfits) == 'table' and outfits or {})
 end)
 
-RegisterNetEvent('node7-clothing:client:close', function()
-    if session then closeSession(false) end
+local function openMenu(targetMenuType)
+    if menuOpen then return end
+    if not loadCatalog(false) then return end
+
+    rebuildFlattened()
+    originalClothes = getCurrentClothes()
+    workingClothes = clone(originalClothes)
+
+    local ped = PlayerPedId()
+    local coords = GetEntityCoords(ped)
+    BeforePosition = vector4(coords.x, coords.y, coords.z, GetEntityHeading(ped))
+
+    clothingRoomTransition(Config.StaticClothingRoom)
+    ped = PlayerPedId()
+    ClearPedTasksImmediately(ped)
+    FreezeEntityPosition(ped, true)
+    forceVisible()
+
+    menuOpen = true
+    menuType = targetMenuType
+    pendingOutfitName = nil
+    checkoutPending = false
+    purchaseInFlight = false
+    pendingPurchaseId = nil
+    SendNUIMessage({ type = 'paymentClose' })
+    SetNuiFocus(true, true)
+    enableCamera()
+
+    if targetMenuType == 'outfitMenu' then
+        requestOutfits(function(outfits)
+            if not menuOpen or menuType ~= 'outfitMenu' then return end
+            SendNUIMessage({ type = 'outfitMenu', outfits = outfits })
+        end)
+    else
+        SendNUIMessage({ type = 'clothingMenu', clothes = buildClothingValues() })
+    end
+end
+
+RegisterNUICallback('rotateCamera', function(data, cb)
+    if menuOpen then
+        local ped = PlayerPedId()
+        local direction = tostring(data.direction or '')
+        if direction == 'left' then
+            SetEntityHeading(ped, GetEntityHeading(ped) - 10.0)
+        elseif direction == 'right' then
+            SetEntityHeading(ped, GetEntityHeading(ped) + 10.0)
+        end
+    end
+    cb({ ok = menuOpen })
 end)
 
-if Config.EnableCommand ~= false then
-    RegisterCommand(Config.Command or 'clothingstore', function()
-        local store = getNearestStore(15.0)
-        if store then openStore(store.id) else notify('No clothing store is nearby.', 'error') end
-    end, false)
+RegisterNUICallback('setCamera', function(data, cb)
+    if menuOpen and Camera and DoesCamExist(Camera) then
+        local ped = PlayerPedId()
+        local mode = tonumber(data.direction)
+        local playerCoords
+
+        if mode == 1 then
+            playerCoords = GetOffsetFromEntityInWorldCoords(ped, 0.0, 0.75, 0.0)
+            SetCamCoord(Camera, playerCoords.x, playerCoords.y, playerCoords.z + 0.65)
+        elseif mode == 2 then
+            playerCoords = GetOffsetFromEntityInWorldCoords(ped, 0.0, 1.0, 0.0)
+            SetCamCoord(Camera, playerCoords.x, playerCoords.y, playerCoords.z + 0.2)
+        elseif mode == 3 then
+            playerCoords = GetOffsetFromEntityInWorldCoords(ped, 0.0, 2.0, 0.0)
+            SetCamCoord(Camera, playerCoords.x, playerCoords.y, playerCoords.z - 0.5)
+        end
+
+        if playerCoords then
+            SetCamRot(Camera, 0.0, 0.0, GetEntityHeading(ped) + 180.0, 2)
+        end
+    end
+    cb({ ok = menuOpen })
+end)
+
+RegisterNUICallback('applyClothes', function(data, cb)
+    if not menuOpen or type(data.values) ~= 'table' then
+        cb({ ok = false })
+        return
+    end
+
+    for _, value in ipairs(data.values) do
+        local category = tostring(value.name or '')
+        if flattened[category] then
+            local nextItem = itemForFlatIndex(category, value.currentValue)
+            local previous = normalizeItem(workingClothes[category])
+            if previous.model ~= nextItem.model or previous.texture ~= nextItem.texture or previous.remove ~= nextItem.remove then
+                workingClothes[category] = nextItem
+                applySingleCategory(category, nextItem)
+            end
+        end
+    end
+
+    FreezeEntityPosition(PlayerPedId(), true)
+    cb({ ok = true })
+end)
+
+RegisterNUICallback('applySkin', function(_, cb)
+    cb({ ok = false })
+end)
+
+RegisterNUICallback('useOutfit', function(data, cb)
+    if not menuOpen or type(data.skin) ~= 'table' then
+        cb({ ok = false })
+        return
+    end
+
+    outfitActionSequence = outfitActionSequence + 1
+    pendingOutfitActionId = ('%s:use:%s'):format(
+        GetPlayerServerId(PlayerId()),
+        outfitActionSequence
+    )
+
+    TriggerServerEvent(
+        'node7-clothing:server:useOutfit',
+        pendingOutfitActionId,
+        data.skin
+    )
+
+    cb({ ok = true, pending = true })
+end)
+
+RegisterNUICallback('saveOutfit', function(data, cb)
+    if not menuOpen then
+        cb({ ok = false, message = 'The clothing shop is not open.' })
+        return
+    end
+
+    local name = tostring(data.outfitName or '')
+        :gsub('^%s+', '')
+        :gsub('%s+$', '')
+
+    if #name < 2 then
+        cb({ ok = false, message = 'Enter an outfit name.' })
+        return
+    end
+
+    if #name > 40 then
+        name = name:sub(1, 40)
+    end
+
+    pendingOutfitName = name
+    cb({ ok = true, outfitName = name })
+end)
+
+RegisterNUICallback('save', function(_, cb)
+    if menuOpen then beginCheckout() end
+    cb({ ok = true })
+end)
+
+-- QBR's Save path calls closeMenu. Clothing checkout now asks for Cash or Bank first.
+RegisterNUICallback('closeMenu', function(_, cb)
+    if menuOpen then beginCheckout() end
+    cb({ ok = true })
+end)
+
+RegisterNUICallback('beginCheckout', function(_, cb)
+    if menuOpen then
+        beginCheckout()
+    end
+    cb({ ok = menuOpen, checkout = checkoutPending })
+end)
+
+RegisterNUICallback('purchase', function(data, cb)
+    if not menuOpen or not checkoutPending or purchaseInFlight then
+        cb({ ok = false })
+        return
+    end
+
+    local method = tostring(data.method or ''):lower()
+    local allowed = Config.PaymentMethods or { cash = 'Cash', bank = 'Bank' }
+    if not allowed[method] then
+        cb({ ok = false, message = 'Invalid payment method.' })
+        return
+    end
+
+    purchaseSequence = purchaseSequence + 1
+    pendingPurchaseId = ('%s:%s'):format(GetPlayerServerId(PlayerId()), purchaseSequence)
+    purchaseInFlight = true
+
+    TriggerServerEvent(
+        'node7-clothing:server:purchase',
+        pendingPurchaseId,
+        method,
+        workingClothes,
+        pendingOutfitName
+    )
+
+    cb({ ok = true })
+end)
+
+RegisterNUICallback('cancelPayment', function(_, cb)
+    if menuOpen and not purchaseInFlight then
+        checkoutPending = false
+        pendingOutfitName = nil
+        reopenClothingMenu()
+    end
+    cb({ ok = menuOpen and not purchaseInFlight })
+end)
+
+RegisterNetEvent('node7-clothing:client:purchaseResult', function(requestId, result)
+    if not pendingPurchaseId or tostring(requestId or '') ~= pendingPurchaseId then return end
+
+    purchaseInFlight = false
+    pendingPurchaseId = nil
+    result = type(result) == 'table' and result or {}
+
+    if result.success == true and type(result.clothes) == 'table' then
+        workingClothes = clone(result.clothes)
+        SendNUIMessage({
+            type = 'paymentResult',
+            success = true,
+            message = result.message or 'Purchase complete.'
+        })
+        closeMenu(true)
+        return
+    end
+
+    SendNUIMessage({
+        type = 'paymentResult',
+        success = false,
+        message = result.message or 'Payment failed.'
+    })
+end)
+
+
+RegisterNetEvent('node7-clothing:client:outfitActionResult', function(requestId, result)
+    if not pendingOutfitActionId or tostring(requestId or '') ~= pendingOutfitActionId then return end
+
+    pendingOutfitActionId = nil
+    result = type(result) == 'table' and result or {}
+
+    if result.success == true and type(result.clothes) == 'table' then
+        workingClothes = clone(result.clothes)
+        originalClothes = clone(result.clothes)
+        applyFullClothes(workingClothes)
+
+        if menuOpen then
+            FreezeEntityPosition(PlayerPedId(), true)
+        end
+    end
+end)
+
+-- QBR's Close/Escape path calls closeMenu2. Discard the preview.
+RegisterNUICallback('closeMenu2', function(_, cb)
+    if menuOpen then closeMenu(false) end
+    cb({ ok = true })
+end)
+
+RegisterNetEvent('node7-clothing:client:openMenu', function(_, targetMenuType)
+    openMenu(targetMenuType == 'outfitMenu' and 'outfitMenu' or 'clothingMenu')
+end)
+
+RegisterNetEvent('node7-clothing:client:openClothing', function()
+    openMenu('clothingMenu')
+end)
+
+RegisterNetEvent('node7-clothing:client:openOutfits', function()
+    openMenu('outfitMenu')
+end)
+
+local function createPrompt(control, text, group)
+    local prompt = PromptRegisterBegin()
+    PromptSetControlAction(prompt, control)
+    PromptSetText(prompt, CreateVarString(10, 'LITERAL_STRING', text))
+    PromptSetEnabled(prompt, true)
+    PromptSetVisible(prompt, true)
+    PromptSetStandardMode(prompt, true)
+    PromptSetGroup(prompt, group, 0)
+    PromptRegisterEnd(prompt)
+    return prompt
 end
 
 CreateThread(function()
-    Wait(1000)
-    loadCatalog()
-    for _, store in ipairs(Config.Stores or {}) do createBlip(store) end
+    loadCatalog(true)
+
+    for index, store in ipairs(Config.Stores or {}) do
+        local group = GetRandomIntInRange(0, 0xFFFFFF)
+        prompts[index] = {
+            group = group,
+            clothing = createPrompt(Config.ClothingControl or 0xF3830D8E, 'Open ' .. store.name, group),
+            outfits = createPrompt(Config.OutfitsControl or 0xC7B5340A, 'Open Outfits', group)
+        }
+
+        if Config.ShowBlips ~= false and store.showblip ~= false then
+            local blip = Citizen.InvokeNative(0x554D9D53F696D002, 1664425300, store.coords.x, store.coords.y, store.coords.z)
+            SetBlipSprite(blip, Config.BlipSprite or 1195729388, true)
+            SetBlipScale(blip, Config.BlipScale or 0.20)
+            Citizen.InvokeNative(0x9CB1A1623062F402, blip, CreateVarString(10, 'LITERAL_STRING', store.name))
+            prompts[index].blip = blip
+        end
+    end
+
+    SetNuiFocus(false, false)
+    RenderScriptCams(false, false, 0, true, true)
 end)
 
 CreateThread(function()
     while true do
-        local waitTime = 1000
+        local waitTime = 750
 
-        if not session then
-            local store, distance = getNearestStore(Config.DrawDistance or 35.0)
-            if store and distance and distance <= (Config.InteractionDistance or 2.15) then
-                waitTime = 0
-                if not textUiVisible then
-                    lib.showTextUI(('[E] %s'):format(store.label))
-                    textUiVisible = true
-                end
+        if not menuOpen then
+            local ped = PlayerPedId()
+            local coords = GetEntityCoords(ped)
 
-                if IsControlJustReleased(0, Config.OpenControl or 0xCEFD9220) then
-                    if textUiVisible then
-                        lib.hideTextUI()
-                        textUiVisible = false
+            for index, store in ipairs(Config.Stores or {}) do
+                local distance = #(coords - store.coords)
+                if distance <= (Config.DrawDistance or 25.0) then
+                    waitTime = 0
+                    if distance <= (Config.InteractionDistance or 2.0) then
+                        local promptData = prompts[index]
+                        if promptData then
+                            PromptSetActiveGroupThisFrame(promptData.group, CreateVarString(10, 'LITERAL_STRING', store.name), 1, 0, 0, 0)
+
+                            if PromptHasStandardModeCompleted(promptData.clothing) then
+                                openMenu('clothingMenu')
+                                Wait(500)
+                                break
+                            end
+
+                            if PromptHasStandardModeCompleted(promptData.outfits) then
+                                openMenu('outfitMenu')
+                                Wait(500)
+                                break
+                            end
+                        end
                     end
-                    openStore(store.id)
-                    Wait(500)
                 end
-            elseif textUiVisible then
-                lib.hideTextUI()
-                textUiVisible = false
             end
-        elseif textUiVisible then
-            lib.hideTextUI()
-            textUiVisible = false
+        else
+            waitTime = 200
+            FreezeEntityPosition(PlayerPedId(), true)
+            forceVisible()
         end
 
         Wait(waitTime)
     end
 end)
 
-AddEventHandler('onResourceStop', function(resourceName)
+AddEventHandler('onResourceStart', function(resourceName)
     if resourceName ~= RESOURCE then return end
-    if textUiVisible then lib.hideTextUI() end
-    if session then closeSession(false) else stopCamera() end
-    for _, blip in ipairs(blips) do RemoveBlip(blip) end
+    SetNuiFocus(false, false)
+    RenderScriptCams(false, false, 0, true, true)
 end)
 
-exports('OpenStore', openStore)
-exports('CloseStore', function(keepChanges) if session then closeSession(keepChanges == true) end end)
-exports('GetNearestStore', getNearestStore)
-exports('IsShopping', function() return session ~= nil end)
+AddEventHandler('onResourceStop', function(resourceName)
+    if resourceName ~= RESOURCE then return end
+
+    SetNuiFocus(false, false)
+    disableCamera()
+
+    if menuOpen then
+        applyFullClothes(originalClothes)
+        if BeforePosition then
+            local ped = PlayerPedId()
+            SetEntityCoordsNoOffset(ped, BeforePosition.x, BeforePosition.y, BeforePosition.z, false, false, false)
+            SetEntityHeading(ped, BeforePosition.w or 0.0)
+        end
+    end
+
+    for _, data in pairs(prompts) do
+        if data.clothing then PromptDelete(data.clothing) end
+        if data.outfits then PromptDelete(data.outfits) end
+        if data.blip then RemoveBlip(data.blip) end
+    end
+end)
+
+exports('OpenClothing', function() openMenu('clothingMenu') end)
+exports('OpenOutfits', function() openMenu('outfitMenu') end)
+exports('IsOpen', function() return menuOpen end)
