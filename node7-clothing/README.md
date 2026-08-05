@@ -46,3 +46,9 @@ Temporary clothing controls now live exclusively in this resource. Available com
 - Face-covering clothing uses the dedicated shop-item removal native instead of rebuilding the full MetaPed head.
 - Face-covering toggles restore only the purchased beard through `node7-barbers`.
 - Corrected RedM shop-item apply flags.
+
+
+## 2.4.2 mask-off player load
+- Saved masks are removed from the live ped after character appearance finishes loading.
+- The purchased/saved mask is kept available for `/mask`; it is not deleted from wardrobe or appearance data.
+- No other clothing category is changed during player load.

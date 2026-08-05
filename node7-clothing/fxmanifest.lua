@@ -8,7 +8,7 @@ lua54 'yes'
 author 'NODE7 Development Studios'
 name 'node7-clothing'
 description 'Server-authoritative NODE7 clothing shops, wearable commands, cash and bank checkout.'
-version '2.4.1'
+version '2.4.2'
 
 ui_page 'html/dist/index.html'
 

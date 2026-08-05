@@ -24,6 +24,8 @@ local barberRestoreRevision = 0
 local hiddenCommandItems = {}
 local wearableCommandState = {}
 local catalogNameCache = {}
+local playerLoadMaskRevision = 0
+local playerLoadMaskPending = false
 
 local function clone(value)
     if type(value) ~= 'table' then return value end
@@ -342,6 +344,68 @@ local function itemHasValue(item)
     return (tonumber(item.hash) or 0) > 0 or (tonumber(item.model) or 0) > 0
 end
 
+-- Saved masks remain owned by appearance, but they should never spawn enabled.
+-- Keep the saved item in the temporary command cache so /mask can restore it,
+-- then remove only the live mask component after character appearance finishes.
+local function removeMaskAfterPlayerLoad(revision)
+    if not playerLoadMaskPending or revision ~= playerLoadMaskRevision then return false end
+    if GetResourceState('node7-appearance') ~= 'started' then return false end
+
+    local clothes = getCurrentClothes()
+    if type(clothes) ~= 'table' or next(clothes) == nil then return false end
+
+    local savedMask = clothes.masks or clothes.mask
+    local previousHidden = hiddenCommandItems.masks
+
+    if itemHasValue(savedMask) then
+        hiddenCommandItems.masks = clone(savedMask)
+    end
+
+    local removed = applyCategoryBatch({
+        {
+            category = 'masks',
+            item = { model = 0, texture = 1, remove = true }
+        }
+    })
+
+    if not removed then
+        hiddenCommandItems.masks = previousHidden
+        return false
+    end
+
+    wearableCommandState.masks = nil
+    playerLoadMaskPending = false
+    debugLog('saved mask removed for player load; /mask can restore it')
+    return true
+end
+
+local function queueMaskRemovalForPlayerLoad()
+    playerLoadMaskRevision = playerLoadMaskRevision + 1
+    local revision = playerLoadMaskRevision
+
+    clearCommandState()
+    playerLoadMaskPending = true
+
+    CreateThread(function()
+        -- Appearance normally emits its completion event first. This retry loop
+        -- covers slower database/server restarts without removing the mask later
+        -- during normal gameplay.
+        local deadline = GetGameTimer() + 15000
+        Wait(500)
+
+        while playerLoadMaskPending
+            and revision == playerLoadMaskRevision
+            and GetGameTimer() < deadline do
+            if removeMaskAfterPlayerLoad(revision) then return end
+            Wait(500)
+        end
+
+        if revision == playerLoadMaskRevision then
+            playerLoadMaskPending = false
+        end
+    end)
+end
+
 local function getCommandConfig(value)
     value = tostring(value or ''):lower()
 
@@ -621,6 +685,18 @@ local function registerClothingCommands()
         end
     end
 end
+
+RegisterNetEvent('Node7Core:Client:OnPlayerLoaded', queueMaskRemovalForPlayerLoad)
+
+RegisterNetEvent('node7-appearance:client:applied', function()
+    if not playerLoadMaskPending then return end
+
+    local revision = playerLoadMaskRevision
+    CreateThread(function()
+        Wait(75)
+        removeMaskAfterPlayerLoad(revision)
+    end)
+end)
 
 RegisterNetEvent('node7-clothing:client:toggleCategory', toggleCommandCategory)
 RegisterNetEvent('node7-clothing:client:dress', dressCommands)
