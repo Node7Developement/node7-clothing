@@ -20,6 +20,10 @@ local purchaseSequence = 0
 local pendingPurchaseId = nil
 local outfitActionSequence = 0
 local pendingOutfitActionId = nil
+local barberRestoreRevision = 0
+local hiddenCommandItems = {}
+local wearableCommandState = {}
+local catalogNameCache = {}
 
 local function clone(value)
     if type(value) ~= 'table' then return value end
@@ -118,12 +122,14 @@ local function normalizeItem(item)
 
     local model = math.floor(tonumber(item.model) or 0)
     local texture = math.max(1, math.floor(tonumber(item.texture) or 1))
+    local hash = tonumber(item.hash)
+    local hasHash = hash and hash > 0
 
     return {
         model = model,
         texture = texture,
-        hash = tonumber(item.hash),
-        remove = item.remove == true or model <= 0
+        hash = hash,
+        remove = item.remove == true or (model <= 0 and not hasHash)
     }
 end
 
@@ -133,6 +139,7 @@ local function sameItem(left, right)
 
     return left.model == right.model
         and left.texture == right.texture
+        and tonumber(left.hash or 0) == tonumber(right.hash or 0)
         and left.remove == right.remove
 end
 
@@ -194,20 +201,103 @@ local function refreshPed(ped)
     Citizen.InvokeNative(0xCC8CA3E88256E58F, ped, 0, 1, 1, 1, 0)
 end
 
-local function applySingleCategory(category, item)
-    local ped = PlayerPedId()
-    item = normalizeItem(item)
+-- Clothing refreshes can rebuild MetaPed state and temporarily remove barber-owned
+-- hair, beard, eyebrow, eye, and facial data. Debounce one restore after the final
+-- clothing refresh instead of making node7-barbers fight every component change.
+local function scheduleBarberRestore(delay, beardOnly)
+    barberRestoreRevision = barberRestoreRevision + 1
+    local revision = barberRestoreRevision
 
-    local ok, err = pcall(function()
-        Citizen.InvokeNative(0xD710A5007C2AC539, ped, GetHashKey(category), 0)
-        if not item.remove and item.hash then
-            Citizen.InvokeNative(0xD3A7B003ED343FD9, ped, item.hash, true, true, true)
+    CreateThread(function()
+        Wait(math.max(0, math.floor(tonumber(delay) or 150)))
+        if revision ~= barberRestoreRevision then return end
+        if GetResourceState('node7-barbers') ~= 'started' then return end
+
+        if beardOnly then
+            -- Mask and neckwear toggles must not rebuild the entire barber state.
+            -- Restore only the purchased beard after the component change settles.
+            local restored = false
+            local ok, result = pcall(function()
+                return exports['node7-barbers']:RestoreBeardNow()
+            end)
+            restored = ok and result == true
+
+            if not restored then
+                pcall(function()
+                    exports['node7-barbers']:RestoreBeard()
+                end)
+            end
+            return
         end
-        refreshPed(ped)
+
+        -- Full clothing/outfit rebuilds may affect every barber-owned head value.
+        TriggerEvent('node7-appearance:client:applied')
+    end)
+end
+
+local function isFaceCoveringCategory(category)
+    category = tostring(category or ''):lower()
+    return category == 'masks' or category == 'mask'
+        or category == 'neckwear' or category == 'bandana'
+end
+
+local function applyCategoryComponent(ped, category, item)
+    item = normalizeItem(item)
+    local categoryHash = GetHashKey(category)
+
+    if item.remove then
+        if isFaceCoveringCategory(category) then
+            -- Use the dedicated shop-item removal native for masks/neckwear.
+            -- REMOVE_TAG + a full variation refresh was rebuilding the head and
+            -- deleting the paid beard along with the face covering.
+            Citizen.InvokeNative(0xDF631E4BCE1B1FC4, ped, categoryHash, true, true, true)
+            return false
+        end
+
+        Citizen.InvokeNative(0xD710A5007C2AC539, ped, categoryHash, 0)
+        return true
+    end
+
+    Citizen.InvokeNative(0xD710A5007C2AC539, ped, categoryHash, 0)
+    if item.hash then
+        -- The final flag must be true for RedM shop items. The previous false
+        -- value prevented facial-hair components from being restored reliably.
+        Citizen.InvokeNative(0xD3A7B003ED343FD9, ped, item.hash, true, true, true)
+    end
+    return true
+end
+
+local function applyCategoryBatch(changes)
+    if type(changes) ~= 'table' or #changes == 0 then return true end
+
+    local ped = PlayerPedId()
+    local needsVariation = false
+    local beardOnlyRestore = true
+    local ok, err = pcall(function()
+        for index = 1, #changes do
+            local change = changes[index]
+            needsVariation = applyCategoryComponent(ped, change.category, change.item) or needsVariation
+            beardOnlyRestore = beardOnlyRestore and isFaceCoveringCategory(change.category)
+        end
+
+        if needsVariation then
+            refreshPed(ped)
+        end
     end)
 
     if not ok then debugLog(err) end
     forceVisible()
+
+    if ok then
+        -- Face-covering commands restore only the beard. Other clothing changes
+        -- can request the complete barber-owned head state.
+        scheduleBarberRestore(beardOnlyRestore and 75 or 225, beardOnlyRestore)
+
+        for index = 1, #changes do
+            TriggerEvent('node7-clothing:client:componentApplied', changes[index].category)
+        end
+    end
+
     return ok
 end
 
@@ -231,8 +321,328 @@ local function applyFullClothes(clothes)
 
     if not ok then debugLog(err) end
     forceVisible()
+
+    if ok then
+        -- ApplyClothes performs a full MetaPed rebuild. Restore barber-owned state
+        -- only after that rebuild and its collision/variation work have settled.
+        scheduleBarberRestore(325)
+    end
+
     return ok
 end
+
+
+local function clearCommandState()
+    hiddenCommandItems = {}
+    wearableCommandState = {}
+end
+
+local function itemHasValue(item)
+    if type(item) ~= 'table' or item.remove == true then return false end
+    return (tonumber(item.hash) or 0) > 0 or (tonumber(item.model) or 0) > 0
+end
+
+local function getCommandConfig(value)
+    value = tostring(value or ''):lower()
+
+    -- Explicit command/name matches must win over category aliases.
+    for _, item in ipairs(Config.CommandCategories or {}) do
+        if tostring(item.command or ''):lower() == value
+            or tostring(item.name or ''):lower() == value then
+            return item
+        end
+    end
+
+    for _, item in ipairs(Config.CommandCategories or {}) do
+        if tostring(item.category or ''):lower() == value then
+            return item
+        end
+    end
+
+    return nil
+end
+
+local function getCatalogItemName(category, item)
+    if type(item) ~= 'table' then return nil end
+    category = tostring(category or '')
+    if category == '' then return nil end
+
+    catalogNameCache[category] = catalogNameCache[category] or {}
+    local categoryCache = catalogNameCache[category]
+    local hash = tonumber(item.hash)
+
+    if hash and categoryCache[hash] ~= nil then
+        return categoryCache[hash] or nil
+    end
+
+    local list = getCategoryList(category) or {}
+    local selected = nil
+
+    if hash and hash > 0 then
+        for _, textures in ipairs(list) do
+            for _, catalogItem in ipairs(textures or {}) do
+                local catalogHash = tonumber(catalogItem.hash)
+                if catalogHash then
+                    categoryCache[catalogHash] = tostring(catalogItem.hashname or ''):lower()
+                end
+                if catalogHash == hash then selected = catalogItem end
+            end
+        end
+    else
+        local model = math.floor(tonumber(item.model) or 0)
+        local texture = math.max(1, math.floor(tonumber(item.texture) or 1))
+        selected = list[model] and list[model][texture] or nil
+    end
+
+    if not selected then
+        if hash then categoryCache[hash] = false end
+        return nil
+    end
+
+    local name = tostring(selected.hashname or ''):lower()
+    if hash then categoryCache[hash] = name end
+    return name ~= '' and name or nil
+end
+
+local function commandMatchesItem(command, item)
+    local match = tostring(command.matchHashname or ''):lower()
+    if match == '' then return true end
+
+    local itemName = getCatalogItemName(command.category, item)
+    -- Older saved clothing rows may not contain enough catalog metadata.
+    -- In that case allow the category toggle to continue normally.
+    if not itemName then return true end
+    return itemName:find(match, 1, true) ~= nil
+end
+
+local function applyWearableState(componentHash, wearableName)
+    local hash = tonumber(componentHash)
+    if not hash or hash <= 0 then return false end
+
+    local ped = PlayerPedId()
+    local ok, err = pcall(function()
+        Citizen.InvokeNative(0x66B957AAC2EAAEAB, ped, hash, joaat(wearableName), 0, true, 1)
+        refreshPed(ped)
+    end)
+
+    if not ok then
+        debugLog(('wearable update failed: %s'):format(tostring(err)))
+        return false
+    end
+
+    forceVisible()
+    scheduleBarberRestore(250)
+    return true
+end
+
+local function toggleWearable(command)
+    local clothes = getCurrentClothes()
+    local current = clothes[command.category]
+
+    if not itemHasValue(current) then
+        notify(('No %s is currently equipped.'):format(command.label or command.category), 'error')
+        return false
+    end
+
+    local activeCommand = wearableCommandState[command.category]
+    local targetState = activeCommand == command.command and 'BASE' or command.wearable
+
+    if not applyWearableState(current.hash, targetState) then
+        notify(('Unable to change %s.'):format(command.label or command.category), 'error')
+        return false
+    end
+
+    if targetState == 'BASE' then
+        wearableCommandState[command.category] = nil
+        notify((command.label or command.command) .. ' reset.', 'success')
+    else
+        wearableCommandState[command.category] = command.command
+        notify((command.label or command.command) .. ' changed.', 'success')
+    end
+
+    return true
+end
+
+local function toggleCommandCategory(value)
+    local command = getCommandConfig(value)
+    if not command then
+        notify('Unknown clothing category.', 'error')
+        return false
+    end
+
+    if command.wearable then
+        return toggleWearable(command)
+    end
+
+    local category = command.category
+    local hidden = hiddenCommandItems[category]
+
+    if hidden then
+        if not commandMatchesItem(command, hidden) then
+            notify(('The hidden %s does not match this command.'):format(command.label or category), 'error')
+            return false
+        end
+
+        if applyCategoryBatch({ { category = category, item = clone(hidden) } }) then
+            hiddenCommandItems[category] = nil
+            notify((command.label or category) .. ' restored.', 'success')
+            return true
+        end
+
+        return false
+    end
+
+    local clothes = getCurrentClothes()
+    local current = clothes[category]
+
+    if not itemHasValue(current) then
+        notify(('No %s is currently equipped.'):format(command.label or category), 'error')
+        return false
+    end
+
+    if not commandMatchesItem(command, current) then
+        notify('No bandana is currently equipped.', 'error')
+        return false
+    end
+
+    hiddenCommandItems[category] = clone(current)
+
+    if applyCategoryBatch({
+        { category = category, item = { model = 0, texture = 1, remove = true } }
+    }) then
+        notify((command.label or category) .. ' removed.', 'success')
+        return true
+    end
+
+    hiddenCommandItems[category] = nil
+    return false
+end
+
+local function undressCommands()
+    local clothes = getCurrentClothes()
+    if next(clothes) == nil then
+        notify('No clothing is currently loaded.', 'error')
+        return false
+    end
+
+    local changes = {}
+    local seen = {}
+
+    for _, command in ipairs(Config.CommandCategories or {}) do
+        local category = command.category
+        if not command.wearable
+            and not command.matchHashname
+            and not seen[category]
+            and not (Config.SafeUndressKeep and Config.SafeUndressKeep[category]) then
+            seen[category] = true
+            local current = clothes[category]
+            if itemHasValue(current) then
+                hiddenCommandItems[category] = hiddenCommandItems[category] or clone(current)
+                changes[#changes + 1] = {
+                    category = category,
+                    item = { model = 0, texture = 1, remove = true }
+                }
+            end
+        end
+    end
+
+    if #changes == 0 then
+        notify('No removable outer clothing is equipped.', 'info')
+        return false
+    end
+
+    local ok = applyCategoryBatch(changes)
+    if ok then notify('Outer clothing removed.', 'success') end
+    return ok
+end
+
+local function dressCommands()
+    local changes = {}
+    for category, item in pairs(hiddenCommandItems) do
+        changes[#changes + 1] = { category = category, item = clone(item) }
+    end
+
+    local restoredAnything = #changes > 0
+    local ok = true
+
+    if #changes > 0 then
+        ok = applyCategoryBatch(changes)
+        if ok then hiddenCommandItems = {} end
+    end
+
+    local wearableChanged = false
+    if next(wearableCommandState) ~= nil then
+        local clothes = getCurrentClothes()
+        local ped = PlayerPedId()
+
+        for category in pairs(wearableCommandState) do
+            local item = clothes[category]
+            if itemHasValue(item) and (tonumber(item.hash) or 0) > 0 then
+                local wearableOk = pcall(function()
+                    Citizen.InvokeNative(0x66B957AAC2EAAEAB, ped, tonumber(item.hash), joaat('BASE'), 0, true, 1)
+                end)
+                wearableChanged = wearableChanged or wearableOk
+            end
+        end
+
+        wearableCommandState = {}
+        if wearableChanged then
+            refreshPed(ped)
+            forceVisible()
+            scheduleBarberRestore(250)
+            restoredAnything = true
+        end
+    end
+
+    if restoredAnything and ok then
+        notify('Clothing restored.', 'success')
+        return true
+    end
+
+    notify('No clothing is currently hidden.', 'info')
+    return false
+end
+
+local function registerClothingCommands()
+    RegisterCommand(Config.DressCommand or 'dress', dressCommands, false)
+    RegisterCommand(Config.UndressCommand or 'undress', undressCommands, false)
+
+    if Config.EnableToggleCommands == false then return end
+
+    local registered = {}
+    for _, command in ipairs(Config.CommandCategories or {}) do
+        local name = tostring(command.command or ''):lower()
+        if name ~= '' and not registered[name] then
+            registered[name] = true
+            local commandName = name
+            RegisterCommand(commandName, function()
+                toggleCommandCategory(commandName)
+            end, false)
+        end
+    end
+end
+
+RegisterNetEvent('node7-clothing:client:toggleCategory', toggleCommandCategory)
+RegisterNetEvent('node7-clothing:client:dress', dressCommands)
+RegisterNetEvent('node7-clothing:client:undress', undressCommands)
+
+-- Compatibility is owned here now that node7-wardrobe is outfit-only.
+RegisterNetEvent('rsg-wardrobe:client:OnOffClothing', toggleCommandCategory)
+RegisterNetEvent('rsg-wardrobe:client:removeAllClothing', undressCommands)
+
+exports('ToggleClothing', toggleCommandCategory)
+exports('RemoveAllClothing', undressCommands)
+exports('DressClothing', dressCommands)
+exports('FixVisibility', forceVisible)
+exports('IsHidden', function(value)
+    local command = getCommandConfig(value)
+    return command and hiddenCommandItems[command.category] ~= nil or false
+end)
+
+CreateThread(function()
+    Wait(500)
+    registerClothingCommands()
+end)
 
 local function buildClothingValues()
     local values = {}
@@ -477,20 +887,29 @@ RegisterNUICallback('applyClothes', function(data, cb)
         return
     end
 
-    for _, value in ipairs(data.values) do
+    local changes = {}
+
+    for index = 1, #data.values do
+        local value = data.values[index]
         local category = tostring(value.name or '')
+
         if flattened[category] then
             local nextItem = itemForFlatIndex(category, value.currentValue)
             local previous = normalizeItem(workingClothes[category])
-            if previous.model ~= nextItem.model or previous.texture ~= nextItem.texture or previous.remove ~= nextItem.remove then
+
+            if not sameItem(previous, nextItem) then
                 workingClothes[category] = nextItem
-                applySingleCategory(category, nextItem)
+                changes[#changes + 1] = {
+                    category = category,
+                    item = nextItem
+                }
             end
         end
     end
 
+    local ok = applyCategoryBatch(changes)
     FreezeEntityPosition(PlayerPedId(), true)
-    cb({ ok = true })
+    cb({ ok = ok, changed = #changes })
 end)
 
 RegisterNUICallback('applySkin', function(_, cb)
@@ -604,6 +1023,7 @@ RegisterNetEvent('node7-clothing:client:purchaseResult', function(requestId, res
     result = type(result) == 'table' and result or {}
 
     if result.success == true and type(result.clothes) == 'table' then
+        clearCommandState()
         workingClothes = clone(result.clothes)
         SendNUIMessage({
             type = 'paymentResult',
@@ -629,6 +1049,7 @@ RegisterNetEvent('node7-clothing:client:outfitActionResult', function(requestId,
     result = type(result) == 'table' and result or {}
 
     if result.success == true and type(result.clothes) == 'table' then
+        clearCommandState()
         workingClothes = clone(result.clothes)
         originalClothes = clone(result.clothes)
         applyFullClothes(workingClothes)

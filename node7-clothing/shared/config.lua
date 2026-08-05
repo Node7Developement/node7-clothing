@@ -65,3 +65,58 @@ Config.Stores = {
     { name = 'Van Horn Clothing Store', location = 'vanhorn', coords = vector3(3026.85, 561.83, 44.72), showblip = true },
     { name = 'Wallace Station Clothing Store', location = 'wallace', coords = vector3(-1295.34, 393.17, 95.38), showblip = true }
 }
+
+
+-- Clothing commands live here exclusively. node7-wardrobe remains outfit-only.
+Config.EnableToggleCommands = true
+Config.DressCommand = 'dress'
+Config.UndressCommand = 'undress'
+
+-- /undress keeps body-critical clothing equipped.
+Config.SafeUndressKeep = {
+    pants = true,
+    boots = true,
+    shirts_full = true,
+    skirts = true
+}
+
+Config.CommandCategories = {
+    { command = 'hat',             category = 'hats',                 label = 'Hat' },
+    { command = 'shirt',           category = 'shirts_full',          label = 'Shirt' },
+    { command = 'pants',           category = 'pants',                label = 'Pants' },
+    { command = 'boots',           category = 'boots',                label = 'Boots' },
+    { command = 'coat',            category = 'coats',                label = 'Coat' },
+    { command = 'closedcoat',      category = 'coats_closed',         label = 'Closed Coat' },
+    { command = 'gloves',          category = 'gloves',               label = 'Gloves' },
+    { command = 'poncho',          category = 'ponchos',              label = 'Poncho' },
+    { command = 'vest',            category = 'vests',                label = 'Vest' },
+    { command = 'eyewear',         category = 'eyewear',              label = 'Eyewear' },
+    { command = 'belt',            category = 'belts',                label = 'Belt' },
+    { command = 'cloak',           category = 'cloaks',               label = 'Cloak' },
+    { command = 'chaps',           category = 'chaps',                label = 'Chaps' },
+    { command = 'mask',            category = 'masks',                label = 'Mask' },
+    { command = 'neckwear',        category = 'neckwear',             label = 'Neckwear' },
+    { command = 'accessories',     category = 'accessories',          label = 'Accessories' },
+    { command = 'gauntlets',       category = 'gauntlets',            label = 'Gauntlets' },
+    { command = 'neckties',        category = 'neckties',             label = 'Neckties' },
+    { command = 'loadouts',        category = 'loadouts',             label = 'Loadouts' },
+    { command = 'suspenders',      category = 'suspenders',           label = 'Suspenders' },
+    { command = 'satchels',        category = 'satchels',             label = 'Satchels' },
+    { command = 'gunbelt',         category = 'gunbelts',             label = 'Gunbelt' },
+    { command = 'buckle',          category = 'buckles',              label = 'Buckle' },
+    { command = 'skirt',           category = 'skirts',               label = 'Skirt' },
+    { command = 'armor',           category = 'armor',                label = 'Armor' },
+    { command = 'hairaccessories', category = 'hair_accessories',     label = 'Hair Accessory' },
+    { command = 'leftring',        category = 'jewelry_rings_left',   label = 'Left Ring' },
+    { command = 'rightring',       category = 'jewelry_rings_right',  label = 'Right Ring' },
+    { command = 'leftholster',     category = 'holsters_left',        label = 'Left Holster' },
+    { command = 'rightholster',    category = 'holsters_right',       label = 'Right Holster' },
+    { command = 'bootaccessories', category = 'boot_accessories',     label = 'Boot Accessories' },
+    { command = 'spats',           category = 'spats',                label = 'Spats' },
+    { command = 'badges',          category = 'badges',               label = 'Badges' },
+    { command = 'bracelets',       category = 'jewelry_bracelets',    label = 'Bracelets' },
+    { command = 'apron',           category = 'aprons',               label = 'Apron' },
+    { command = 'sleeve',          category = 'shirts_full',          label = 'Sleeves', wearable = 'closed_collar_rolled_sleeve' },
+    { command = 'collar1',         category = 'shirts_full',          label = 'Open Rolled Collar', wearable = 'open_collar_rolled_sleeve' },
+    { command = 'collar2',         category = 'shirts_full',          label = 'Open Full Collar', wearable = 'open_collar_full_sleeve' }
+}
